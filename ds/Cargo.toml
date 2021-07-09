@@ -10,5 +10,4 @@ byteorder = "*"
 rand = "*"
 cache_line_size = "*"
 log = { path = "../log" }
-#log = "*"
 lockfree = "*"

@@ -74,12 +74,7 @@ where
             let mut buf = me.data.as_mut_bytes();
             log::debug!("resp-handler: {} bytes available oft:{}", buf.len(), offset);
             if buf.len() == 0 {
-                log::info!(
-                    "resp-handler: buffer full. read:{} processed:{} write:{}",
-                    offset,
-                    me.data.processed(),
-                    me.data.writtened()
-                );
+                log::info!("resp-handler: buffer full");
                 std::hint::spin_loop();
                 continue;
             }
@@ -114,15 +109,16 @@ where
                 }
                 response.resize(num);
                 let seq = me.seq;
-                me.seq += 1;
-                log::debug!(
-                    "resp-handler: response len: {} loc:{:?}",
-                    num,
-                    response.location()
-                );
-
                 me.w.on_received(seq, response);
+                log::debug!(
+                    "resp-handler: response found. len: {} seq:{} {} => {}",
+                    num,
+                    seq,
+                    me.data.processed(),
+                    me.data.writtened()
+                );
                 me.data.advance_processed(num);
+                me.seq += 1;
             }
         }
         log::debug!("resp-handler: task of reading data from response complete");

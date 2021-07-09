@@ -16,6 +16,7 @@ use protocol::{Request, RequestId};
 unsafe impl<W> Send for BridgeBufferToWriter<W> {}
 unsafe impl<W> Sync for BridgeBufferToWriter<W> {}
 
+#[derive(Clone)]
 pub struct RequestData {
     id: usize,
     data: Request,
@@ -25,7 +26,8 @@ impl RequestData {
     pub fn from(id: usize, b: Request) -> Self {
         Self { id: id, data: b }
     }
-    fn data(&self) -> &[u8] {
+    // TODO debug完毕后，去掉pub
+    pub fn data(&self) -> &[u8] {
         &self.data.data()
     }
     fn cid(&self) -> usize {
@@ -37,6 +39,8 @@ impl RequestData {
 }
 
 pub trait RequestHandler {
+    // 把更新seq与更新状态分开。避免response在执行on_received之前返回时，会依赖seq做判断
+    fn on_received_seq(&self, id: usize, seq: usize);
     fn on_received(&self, id: usize, seq: usize);
 }
 
@@ -91,6 +95,7 @@ where
             debug_assert!(!buff.is_empty());
             log::debug!("req-handler-writer: send buffer {} ", buff.len());
             let num = ready!(writer.as_mut().poll_write(cx, buff))?;
+            println!("=====222=== in req_handler buf-to-writer: req:{:?}", buff);
             debug_assert!(num > 0);
             log::debug!("req-handler-writer: {} bytes sent", num);
             me.reader.consume(num);
@@ -140,23 +145,26 @@ where
         while !me.done.load(Ordering::Relaxed) {
             if let Some(ref req) = me.cache {
                 let data = req.data();
+                println!("====11111==== in req_handler req-to-buff: req:{:?}", data);
                 log::debug!(
                     "req-handler-buffer: received. cid: {} len:{} rid:{:?}",
                     req.cid(),
                     req.data().len(),
                     req.rid()
                 );
-                ready!(me.w.poll_check_available(cx, data.len()));
-                me.r.on_received(req.cid(), me.seq);
-                me.w.poll_put_no_check(data)?;
+                me.r.on_received_seq(req.cid(), me.seq);
+                ready!(me.w.poll_put_slice(cx, data))?;
+                println!("====22222==== in req_handler req-to-buff: req:{:?}", data);
+                let seq = me.seq;
+                me.seq += 1;
+                me.r.on_received(req.cid(), seq);
                 log::debug!(
                     "req-handler-buffer: received and write to buffer. len:{} id:{} seq:{}, rid:{:?}",
                     req.data().len(),
                     req.cid(),
-                    me.seq,
+                    seq,
                     req.rid()
                 );
-                me.seq += 1;
             }
             me.cache.take();
             log::debug!("req-handler-buffer: bridge request to buffer: wating incomming data");
@@ -167,6 +175,13 @@ where
                 break;
             }
             me.cache = result;
+
+            // just for debug
+            let tmp = me.cache.clone();
+            println!(
+                "====000000000==== in req_handler req-to-buff: req:{:?}",
+                tmp.unwrap().data()
+            );
             log::debug!("req-handler-buffer: one request received from request channel");
         }
         Poll::Ready(Ok(()))

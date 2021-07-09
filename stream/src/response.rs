@@ -12,14 +12,12 @@ pub(crate) struct Item {
 pub struct ResponseData {
     data: RingSlice,
     req_id: RequestId,
-    seq: usize, // response的seq
 }
 impl ResponseData {
-    pub fn from(data: RingSlice, rid: RequestId, resp_seq: usize) -> Self {
+    pub fn from(data: RingSlice, rid: RequestId) -> Self {
         Self {
             data: data,
             req_id: rid,
-            seq: resp_seq,
         }
     }
     pub fn data(&self) -> &RingSlice {
@@ -27,9 +25,6 @@ impl ResponseData {
     }
     pub fn rid(&self) -> &RequestId {
         &self.req_id
-    }
-    pub fn seq(&self) -> usize {
-        self.seq
     }
 }
 
@@ -51,6 +46,32 @@ impl Response {
     }
     pub fn append(&mut self, other: Response) {
         self.items.extend(other.items);
+    }
+    // 去掉消息的结尾部分
+    pub fn cut_tail(&mut self, tail_size: usize) -> bool {
+        if self.items.len() == 0 {
+            println!(" no tail to cut");
+            return false;
+        }
+        // 之前已经都出了response
+        let idx = self.items.len() - 1;
+        let last_resp = self.items.get_mut(idx).unwrap();
+        let last_len = last_resp.len();
+        if last_len > tail_size {
+            last_resp.resize(last_len - tail_size);
+            println!(" cut tail/{} from len/{}", tail_size, last_len);
+        } else if last_len < tail_size {
+            println!(
+                "found malformed response when cut tail with size/{}",
+                tail_size
+            );
+            return false;
+        } else if last_len == tail_size {
+            // 上一个响应是一个empty response，扔掉该响应
+            self.items.pop();
+            println!("cut an empty resp");
+        }
+        return true;
     }
     pub(crate) fn into_items(self) -> Vec<Item> {
         self.items

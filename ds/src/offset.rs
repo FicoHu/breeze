@@ -1,10 +1,11 @@
 use lockfree::map::Map;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 /// 无锁，支持并发更新offset，按顺序读取offset的数据结构
 pub struct SeqOffset {
     tries: usize,
     offset: AtomicUsize,
+    len: AtomicIsize,
     slow_cache: Map<usize, usize>,
 }
 
@@ -14,6 +15,7 @@ impl SeqOffset {
         Self {
             tries: tries,
             offset: AtomicUsize::new(0),
+            len: AtomicIsize::new(0),
             slow_cache: Map::default(),
         }
     }
@@ -23,7 +25,6 @@ impl SeqOffset {
     // TODO 临时存储空间可能会触发OOM
     // end > start
     pub fn insert(&self, start: usize, end: usize) {
-        log::debug!("offset: {} => {}", start, end);
         debug_assert!(end > start);
         for _i in 0..self.tries {
             //loop {
@@ -37,34 +38,21 @@ impl SeqOffset {
                 Err(_offset) => {}
             }
         }
+        self.len.fetch_add(1, Ordering::Relaxed);
         self.slow_cache.insert(start, end);
     }
 
     // load offset, [0.. offset)都已经调用insert被相应的span全部填充
     pub fn load(&self) -> usize {
         let mut offset = self.offset.load(Ordering::Acquire);
-        let mut old = offset;
+        let old = offset;
         while let Some(removed) = self.slow_cache.remove(&offset) {
+            let len = self.len.fetch_add(-1, Ordering::Relaxed);
             offset = *removed.val();
-            //log::debug!("offset: read offset loaded by map:{} ", offset);
+            log::debug!("offset: read offset loaded by map:{} len:{}", offset, len);
         }
-        while old != offset {
-            match self
-                .offset
-                .compare_exchange(old, offset, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                // 失败了。说明可能在这
-                Err(latest) => {
-                    log::info!(
-                        "offset: compare failed. old:{} new:{} act:{}",
-                        old,
-                        offset,
-                        latest
-                    );
-                    old = latest;
-                }
-            }
+        if offset != old {
+            self.offset.store(offset, Ordering::Release);
         }
         offset
     }

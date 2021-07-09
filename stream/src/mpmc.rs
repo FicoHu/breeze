@@ -105,14 +105,13 @@ impl MpmcRingBufferStream {
     }
     pub fn response_done(&self, cid: usize, response: &ResponseData) {
         let item = unsafe { self.items.get_unchecked(cid) };
-        item.response_done(response.seq());
+        item.response_done();
         let (start, end) = response.data().location();
         self.offset.0.insert(start, end);
         log::debug!(
-            "mpmc done. cid:{} start:{} end:{} rid:{:?}",
+            "mpmc poll read complete. cid:{} len:{} rid:{:?}",
             cid,
-            start,
-            end,
+            end - start,
             response.rid()
         );
     }
@@ -130,11 +129,14 @@ impl MpmcRingBufferStream {
             buf.len(),
             buf.id()
         );
+
+        println!("++++++++ in mpmc req: {:?}", buf.clone().inner.data());
         let mut sender = unsafe { self.senders.get_unchecked(cid) }.borrow_mut();
         if sender.0 {
             self.get_item(cid).place_request(buf);
             sender.0 = false;
             let req = RequestData::from(cid, buf.clone());
+            println!("++++++222++ in mpmc req: {:?}", req.clone().data());
             sender.1.start_send(req).ok().expect("channel closed");
         }
         ready!(sender.1.poll_send_done(cx))
@@ -142,6 +144,7 @@ impl MpmcRingBufferStream {
             .expect("channel send failed");
         sender.0 = true;
         log::debug!("mpmc: write complete cid:{} len:{} ", cid, buf.len());
+
         Poll::Ready(Ok(()))
     }
     #[inline]
@@ -164,6 +167,7 @@ impl MpmcRingBufferStream {
                 .get_unchecked(seq_idx)
                 .0
                 .store(cid, Ordering::Release);
+            self.get_item(cid).bind_seq(seq)
         };
     }
     fn place_response(&self, seq: usize, response: RingSlice) {
@@ -179,11 +183,11 @@ impl MpmcRingBufferStream {
                 for it in self.items.iter() {
                     if it.seq() == seq {
                         item = it;
-                        break;
                     }
                 }
             }
-            item.place_response(response, seq);
+            debug_assert_eq!(item.seq(), seq);
+            item.place_response(response);
         }
     }
 
@@ -399,11 +403,10 @@ use std::thread::sleep;
 use std::time::Duration;
 
 impl RequestHandler for Arc<MpmcRingBufferStream> {
-    //fn on_received_seq(&self, id: usize, seq: usize) {
-    //    self.bind_seq(id, seq);
-    //}
-    fn on_received(&self, id: usize, seq: usize) {
+    fn on_received_seq(&self, id: usize, seq: usize) {
         self.bind_seq(id, seq);
+    }
+    fn on_received(&self, id: usize, seq: usize) {
         self.get_item(id).on_sent(seq);
     }
 }
@@ -416,5 +419,115 @@ impl ResponseHandler for Arc<MpmcRingBufferStream> {
     // 在从response读取的数据后调用。
     fn on_received(&self, seq: usize, first: RingSlice) {
         self.place_response(seq, first);
+    }
+}
+
+#[cfg(test)]
+mod mpmc_test {
+    use super::*;
+    use std::pin::Pin;
+    use thread_id;
+
+    struct TestMpmc {
+        senders: Vec<RefCell<(bool, PollSender<RequestData>)>>,
+        receiver: RefCell<Option<Receiver<RequestData>>>,
+    }
+
+    pub struct ReceiverTester {
+        cache: Option<RequestData>,
+        done: Arc<AtomicBool>,
+        seq: usize,
+        receiver: Receiver<RequestData>,
+    }
+
+    impl ReceiverTester {
+        pub fn from(receiver: Receiver<RequestData>, done: Arc<AtomicBool>) -> Self {
+            Self {
+                done: done,
+                seq: 0,
+                receiver: receiver,
+                cache: None,
+            }
+        }
+    }
+
+    impl Future for ReceiverTester {
+        type Output = Result<()>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            log::debug!("thread {}: task polling. ReceiverTester", thread_id::get());
+            let me = &mut *self;
+            let mut receiver = Pin::new(&mut me.receiver);
+            while !me.done.load(Ordering::Relaxed) {
+                log::debug!("thread {}: come into poll loop", thread_id::get());
+                if let Some(req) = me.cache.take() {
+                    let data = req.data();
+                    if !data.len() <= 1 {
+                        assert_eq!(data[0], 0x80);
+                        log::debug!("request  received");
+                        let seq = me.seq;
+                        me.seq += 1;
+                    }
+                }
+                let result = ready!(receiver.as_mut().poll_recv(cx));
+                if result.is_none() {
+                    log::debug!("thread {}: channel closed, quit", thread_id::get());
+                    break;
+                }
+                me.cache = result;
+            }
+            log::debug!("poll done");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn test_mpmc() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let test_mpmc = {
+                let (origin_sender, receiver) = channel(100);
+                let mut sender = PollSender::new(origin_sender);
+                let senders = (0..50)
+                    .map(|_| RefCell::new((true, sender.clone())))
+                    .collect();
+                /*
+                sender.close_this_sender();
+                drop(sender);
+                */
+                log::debug!("thread {}: new testMpmc", thread_id::get());
+
+                TestMpmc {
+                    senders: senders,
+                    receiver: RefCell::new(Some(receiver)),
+                }
+            };
+
+            let done = Arc::new(AtomicBool::new(false));
+
+            let receiver = test_mpmc
+                .receiver
+                .borrow_mut()
+                .take()
+                .expect("receiver exists");
+            log::debug!("thread {}: goto new thread", thread_id::get());
+            tokio::spawn(ReceiverTester::from(receiver, done.clone()));
+
+            std::thread::sleep(Duration::from_secs(5));
+            log::debug!("thread {}: sleep 5 seconds, begin drop", thread_id::get());
+
+            let (sender, receiver) = channel(100);
+            let sender = PollSender::new(sender);
+            // 删除所有的sender，则receiver会会接收到一个None，而不会阻塞
+            for s in test_mpmc.senders.iter() {
+                let (_, mut old) = s.replace((true, sender.clone()));
+                old.close_this_sender();
+                drop(old);
+            }
+            log::debug!("thread {}: drop done", thread_id::get());
+            let old = test_mpmc.receiver.replace(Some(receiver));
+            debug_assert!(old.is_none());
+            std::thread::sleep(Duration::from_secs(5));
+        });
     }
 }

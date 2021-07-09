@@ -5,12 +5,13 @@
 use std::io::Result;
 
 pub mod memcache;
-use ds::RingSlice;
+use ds::{RingSlice, Slice};
 
 mod request;
 pub use request::*;
 
 use enum_dispatch::enum_dispatch;
+use futures::io::ReadVectored;
 
 // 往client写入时，最大的buffer大小。
 pub const MAX_SENT_BUFFER_SIZE: usize = 1024 * 1024;
@@ -41,6 +42,17 @@ pub trait Protocol: Unpin + Clone + 'static {
     // 从response中解析出一个完成的response
     fn parse_response(&self, response: &RingSlice) -> (bool, usize);
     fn response_found<T: AsRef<RingSlice>>(&self, response: T) -> bool;
+    // 轮询response，解析出本次查到的keys以及noop所在的位置
+    fn scan_response_keys<T: AsRef<RingSlice>>(&self, response: T, keys: &mut Vec<String>);
+    // 从当前的cmds中，过滤掉已经查到的keys，然后返回新的请求cmds
+    fn rebuild_get_multi_request(
+        &self,
+        current_cmds: &Request,
+        found_keys: &Vec<String>,
+        new_req_data: &mut Vec<u8>,
+    );
+    // 消息结尾标志的长度，对不同协议、不同请求不同
+    fn tail_size_for_multi_get(&self) -> usize;
 }
 #[enum_dispatch(Protocol)]
 #[derive(Clone)]
